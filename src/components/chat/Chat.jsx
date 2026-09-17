@@ -1,136 +1,228 @@
 import React, { useEffect, useRef, useState } from "react";
-import axios from "axios";
 import PropTypes from "prop-types";
+import { orchestrator } from "../../agents";
 import "./Chat.css";
 
-export const Chat = ({ learningState }) => {
+export const Chat = ({ learningState, isOpen, onToggle }) => {
   const [userInput, setUserInput] = useState("");
   const [chatHistory, setChatHistory] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [showInput, setShowInput] = useState(false);
+  const [internalShow, setInternalShow] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [speechError, setSpeechError] = useState(null);
   const recognitionRef = useRef(null);
+  const transcriptRef = useRef("");
+  const activeRequestIdRef = useRef(0);
 
-  const SpeechRecognition =
-    window.SpeechRecognition || window.webkitSpeechRecognition;
+  const showInput = isOpen !== undefined ? isOpen : internalShow;
+
+  const SpeechRecognitionAPI =
+    typeof window !== "undefined"
+      ? window.SpeechRecognition || window.webkitSpeechRecognition
+      : null;
+
+  // Central Speech Synthesis Stop Helper
+  const stopSpeech = () => {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }
+  };
 
   // voice assistance
   const startListening = () => {
-    if (!SpeechRecognition) {
-      console.error("Speech recognition is not supported in this browser.");
+    if (!SpeechRecognitionAPI) {
+      setSpeechError(
+        "Voice input is not available in this browser. Please use Chrome or Edge, or type your question.",
+      );
       return;
     }
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = "en";
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognitionRef.current = recognition;
+    setSpeechError(null);
 
-    recognition.onresult = (event) => {
-      let interimTranscript = "";
-      let finalTranscript = "";
+    // Stop any existing instance
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // ignore
+      }
+    }
 
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript + " ";
-        } else {
-          interimTranscript += transcript;
+    try {
+      const recognition = new SpeechRecognitionAPI();
+      recognition.lang = "en-US";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognitionRef.current = recognition;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+      };
+
+      recognition.onresult = (event) => {
+        let combined = "";
+        for (let i = 0; i < event.results.length; i++) {
+          combined += event.results[i][0].transcript;
         }
-      }
+        transcriptRef.current = combined;
+        setUserInput(combined);
+      };
 
-      setUserInput(finalTranscript);
-    };
+      recognition.onerror = (event) => {
+        console.warn("Speech recognition notice:", event.error);
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+          setSpeechError(
+            "Microphone access blocked. Please allow microphone permissions in browser settings.",
+          );
+        } else if (event.error !== "no-speech") {
+          setSpeechError(`Voice input: ${event.error}`);
+        }
+        setIsListening(false);
+      };
 
-    recognition.onerror = (event) => {
-      console.error("Speech recognition error:", event.error);
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognition.start();
+    } catch (err) {
+      console.error("Speech recognition start failed:", err);
+      setSpeechError("Could not start voice recognition. Please try typing.");
       setIsListening(false);
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-      if (userInput.trim() !== "") {
-        handleSubmit(new Event("submit"));
-      }
-    };
-
-    recognition.start();
-    setIsListening(true);
+    }
   };
 
   const stopListening = () => {
     if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsListening(false);
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // ignore
+      }
     }
+    setIsListening(false);
   };
 
   const speak = (text) => {
-    const synthesis = window.speechSynthesis;
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.pitch = 1;
-    utterance.rate = 1;
+    if (!text) return;
+    stopSpeech();
+    const synthesis = typeof window !== "undefined" ? window.speechSynthesis : null;
+    if (!synthesis) return;
 
-    utterance.onstart = () => {
-      setIsSpeaking(true);
-    };
-
-    utterance.onend = () => {
-      setIsSpeaking(false);
-    };
-
-    synthesis.speak(utterance);
+    try {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "en-US";
+      utterance.pitch = 1;
+      utterance.rate = 1;
+      synthesis.speak(utterance);
+    } catch (err) {
+      console.warn("Speech synthesis notice:", err);
+    }
   };
 
+  // Stop active speech and recognition when chat is closed via props
   useEffect(() => {
-    if (chatHistory.length > 0) {
-      const lastResponse = chatHistory[chatHistory.length - 1].bot;
-      speak(lastResponse);
+    if (isOpen === false) {
+      activeRequestIdRef.current++;
+      stopSpeech();
+      stopListening();
     }
-  }, [chatHistory]);
-  // end voice assistant
+  }, [isOpen]);
 
-  // event handlers
+  // Clean up recognition instance and TTS on unmount
+  useEffect(() => {
+    return () => {
+      stopSpeech();
+      stopListening();
+    };
+  }, []);
+
   const handleUserInput = (e) => {
     setUserInput(e.target.value);
   };
 
   const handleSubmit = async (e) => {
-    e.preventDefault();
+    if (e && e.preventDefault) e.preventDefault();
+    if (!userInput.trim()) return;
+
+    const currentQuestion = userInput.trim();
+    const requestId = ++activeRequestIdRef.current;
     setLoading(true);
+
     try {
-      const response = await axios.post(
-        "http://localhost:3001/api/chatgpt",
-        {
-          message: userInput,
-          selectedSubject: learningState.selectedSubject,
-          difficulty: learningState.difficulty,
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-          },
-        }
+      const result = await orchestrator.handleStudentQuestion(
+        currentQuestion,
+        learningState,
       );
-      const generatedText = response.data.response;
-      setChatHistory([...chatHistory, { user: userInput, bot: generatedText }]);
+
+      // Async safety check: ignore if request was cancelled or superseded
+      if (requestId !== activeRequestIdRef.current) {
+        return;
+      }
+
+      const generatedText = result.response;
+      setChatHistory((prev) => [
+        ...prev,
+        { user: currentQuestion, bot: generatedText },
+      ]);
       setUserInput("");
+      transcriptRef.current = "";
+
+      // Play text-to-speech for newly arrived response
+      speak(generatedText);
     } catch (error) {
-      console.error("Error:", error);
+      if (requestId !== activeRequestIdRef.current) return;
+
+      console.error("Chat: Error delegating question to TutorAgent via Orchestrator:", error);
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          user: currentQuestion,
+          bot: "Sorry, I encountered an error while contacting Teacher Emilian.",
+        },
+      ]);
+    } finally {
+      if (requestId === activeRequestIdRef.current) {
+        setLoading(false);
+      }
     }
-    setLoading(false);
+  };
+
+  const handleClose = () => {
+    activeRequestIdRef.current++;
+    stopSpeech();
+    stopListening();
+    if (onToggle) {
+      onToggle(false);
+    } else {
+      setInternalShow(false);
+    }
   };
 
   const toggleInput = () => {
-    setShowInput(!showInput);
+    if (showInput) {
+      handleClose();
+    } else {
+      if (onToggle) {
+        onToggle(true);
+      } else {
+        setInternalShow(true);
+      }
+    }
   };
 
   const handleClear = () => {
+    activeRequestIdRef.current++;
+    stopSpeech();
+    stopListening();
     setChatHistory([]);
     setUserInput("");
+    transcriptRef.current = "";
+    setSpeechError(null);
   };
 
   return (
@@ -138,8 +230,8 @@ export const Chat = ({ learningState }) => {
       className="chat-component"
       data-selected-subject={learningState.selectedSubject}
     >
-      <button className="chat-button" onClick={toggleInput}>
-        {showInput ? "Close Chat" : "Ask a Question"}
+      <button className="chat-button" onClick={toggleInput} type="button">
+        {showInput ? "Close Chat (T)" : "💬 Ask Teacher (T)"}
       </button>
       {showInput && (
         <div className={`chat-box ${showInput ? "show" : ""}`}>
@@ -148,8 +240,8 @@ export const Chat = ({ learningState }) => {
               <div className="content">
                 {chatHistory.length === 0 ? (
                   <p className="welcome-message">
-                    Welcome to the chat! Ask a question to start a conversation
-                    with the Teacher Emilian.
+                    Welcome to the 3D Classroom! Ask Teacher Emilian a question
+                    about {learningState.selectedSubject || "AI"}.
                   </p>
                 ) : (
                   chatHistory.map((chat, index) => (
@@ -158,7 +250,7 @@ export const Chat = ({ learningState }) => {
                         <strong>You:</strong> {chat.user}
                       </p>
                       <p className="teacher-response">
-                        <strong>ChatGPT:</strong> {chat.bot}
+                        <strong>Teacher Emilian:</strong> {chat.bot}
                       </p>
                     </div>
                   ))
@@ -170,19 +262,43 @@ export const Chat = ({ learningState }) => {
                     type="text"
                     value={userInput}
                     onChange={handleUserInput}
-                    placeholder="Type your message..."
+                    placeholder="Type your question..."
                     required
                   />
-                  {SpeechRecognition && (
+                  {SpeechRecognitionAPI ? (
                     <button
                       type="button"
-                      onMouseDown={startListening}
-                      onMouseUp={stopListening}
-                      onTouchStart={startListening}
-                      onTouchEnd={stopListening}
+                      className={`voice-record-btn ${isListening ? "listening" : ""}`}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        startListening();
+                      }}
+                      onPointerUp={(e) => {
+                        e.preventDefault();
+                        stopListening();
+                      }}
+                      onPointerLeave={() => {
+                        if (isListening) stopListening();
+                      }}
+                      onPointerCancel={() => {
+                        if (isListening) stopListening();
+                      }}
+                      onTouchStart={(e) => {
+                        e.preventDefault();
+                        startListening();
+                      }}
+                      onTouchEnd={(e) => {
+                        e.preventDefault();
+                        stopListening();
+                      }}
+                      title="Hold to speak, release to stop"
                     >
-                      {isListening ? "Listening..." : "Hold to Speak"}
+                      {isListening ? "🔴 Listening..." : "🎙️ Hold to Speak"}
                     </button>
+                  ) : (
+                    <div className="voice-unsupported-badge" title="Voice recognition not supported in this browser. Please use Chrome/Edge.">
+                      🎙️ Mic Unavailable
+                    </div>
                   )}
                   <button type="submit" disabled={loading}>
                     <i className="send-icon">{loading ? "Sending..." : "➤"}</i>
@@ -190,12 +306,35 @@ export const Chat = ({ learningState }) => {
                   </button>
                 </form>
               </div>
+              {speechError && (
+                <div
+                  style={{
+                    color: "#ffe4e6",
+                    background: "rgba(225, 29, 72, 0.8)",
+                    padding: "8px 14px",
+                    borderRadius: "8px",
+                    fontSize: "13px",
+                    marginTop: "8px",
+                    textAlign: "center",
+                  }}
+                >
+                  ⚠️ {speechError}
+                </div>
+              )}
               {chatHistory.length > 0 && (
                 <div className="buttons">
                   <button
                     type="button"
+                    className="stop-speech-action"
+                    onClick={stopSpeech}
+                    title="Stop text-to-speech immediately"
+                  >
+                    ⏹️ Stop Speaking
+                  </button>
+                  <button
+                    type="button"
                     className="confirm"
-                    onClick={toggleInput}
+                    onClick={handleClose}
                   >
                     Close
                   </button>
@@ -219,6 +358,11 @@ export const Chat = ({ learningState }) => {
 Chat.propTypes = {
   learningState: PropTypes.shape({
     selectedSubject: PropTypes.string.isRequired,
-    difficulty: PropTypes.string.isRequired,
+    difficulty: PropTypes.string,
+    currentDifficulty: PropTypes.string,
   }).isRequired,
+  isOpen: PropTypes.bool,
+  onToggle: PropTypes.func,
 };
+
+export default Chat;

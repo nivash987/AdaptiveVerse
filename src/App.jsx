@@ -1,34 +1,31 @@
 import "./App.css";
 import Experience from "./components/Experience";
 import { Chat } from "./components/chat/Chat";
-
+import { orchestrator, qLearningAgent } from "./agents";
+import { requestImmersiveVRSession, isWebXRAvailable } from "./utils/webxr";
 import React from "react";
 
 const subjects = ["Artificial Intelligence", "Machine Learning"];
-const difficultyLevels = ["beginner", "intermediate", "advanced"];
-
-const getNextDifficulty = (currentDifficulty, isCorrect) => {
-  const currentIndex = difficultyLevels.indexOf(currentDifficulty);
-  const nextIndex = isCorrect ? currentIndex + 1 : currentIndex - 1;
-  const clampedIndex = Math.min(
-    Math.max(nextIndex, 0),
-    difficultyLevels.length - 1,
-  );
-
-  return difficultyLevels[clampedIndex];
-};
 
 const App = () => {
-  const [learningState, setLearningState] = React.useState({
-    selectedSubject: "Artificial Intelligence",
-    difficulty: "beginner",
-    questionsAnswered: 0,
-    correctAnswers: 0,
-  });
+  const [isChatOpen, setIsChatOpen] = React.useState(false);
+  const [learningState, setLearningState] = React.useState(() =>
+    orchestrator.createInitialStudentState({
+      selectedSubject: "Artificial Intelligence",
+      difficulty: "beginner",
+      currentDifficulty: "beginner",
+    }),
+  );
   const [quizQuestion, setQuizQuestion] = React.useState(null);
   const [selectedOption, setSelectedOption] = React.useState("");
   const [quizFeedback, setQuizFeedback] = React.useState("");
   const [quizLoading, setQuizLoading] = React.useState(false);
+  const [qTelemetry, setQTelemetry] = React.useState(() =>
+    qLearningAgent.getTelemetry(),
+  );
+  const [vrModalMessage, setVrModalMessage] = React.useState(null);
+  const glRendererRef = React.useRef(null);
+
   const accuracy =
     learningState.questionsAnswered === 0
       ? 0
@@ -40,68 +37,55 @@ const App = () => {
   React.useEffect(() => {
     const fetchProgress = async () => {
       try {
-        const response = await fetch("http://localhost:3001/api/progress");
-        if (response.ok) {
-          const data = await response.json();
-          setLearningState((currentState) => ({
-            ...currentState,
-            questionsAnswered:
-              data.totalQuestions ?? currentState.questionsAnswered,
-            correctAnswers: data.correctAnswers ?? currentState.correctAnswers,
-          }));
+        const result = await orchestrator.loadStudentProgress();
+        if (result.success && result.rawData) {
+          setLearningState((currentState) => {
+            const data = result.rawData;
+            const totalQuestions =
+              data.totalQuestions ?? currentState.questionsAnswered ?? 0;
+            const correctAnswers =
+              data.correctAnswers ?? currentState.correctAnswers ?? 0;
+            const calculatedAccuracy =
+              totalQuestions === 0
+                ? 0
+                : Math.round((correctAnswers / totalQuestions) * 100);
+
+            return {
+              ...currentState,
+              questionsAnswered: totalQuestions,
+              correctAnswers: correctAnswers,
+              accuracy: calculatedAccuracy,
+              recentAttempts:
+                data.recentAttempts || currentState.recentAttempts || [],
+            };
+          });
         }
       } catch (error) {
-        console.error("Error fetching student progress:", error);
+        console.error("App: Error fetching student progress via Orchestrator:", error);
       }
     };
 
     fetchProgress();
   }, []);
 
-  const generateQuizQuestion = async () => {
+  const generateQuizQuestion = React.useCallback(async () => {
     setQuizLoading(true);
     setSelectedOption("");
     setQuizFeedback("");
 
     try {
-      const response = await fetch(
-        "http://localhost:3001/api/generate-quiz-question",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            selectedSubject: learningState.selectedSubject,
-            difficulty: learningState.difficulty,
-          }),
-        },
-      );
+      const result = await orchestrator.generateAssessment(learningState);
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+      if (!result.success || !result.question) {
         setQuizQuestion(null);
         setQuizFeedback(
-          errorData.error || "Failed to generate quiz question. Please try again.",
+          result.error || "Failed to generate quiz question. Please try again.",
         );
-        setQuizLoading(false);
-        return;
-      }
-
-      const question = await response.json();
-      if (
-        !question ||
-        !question.question ||
-        !Array.isArray(question.options) ||
-        !question.correctAnswer
-      ) {
-        setQuizQuestion(null);
-        setQuizFeedback("Invalid quiz format received. Please try again.");
       } else {
-        setQuizQuestion(question);
+        setQuizQuestion(result.question);
       }
     } catch (error) {
-      console.error("Error generating quiz question:", error);
+      console.error("App: Error generating quiz question via Orchestrator:", error);
       setQuizQuestion(null);
       setQuizFeedback(
         "Unable to connect to the quiz server. Please check your connection.",
@@ -109,9 +93,9 @@ const App = () => {
     }
 
     setQuizLoading(false);
-  };
+  }, [learningState]);
 
-  const submitQuizAnswer = () => {
+  const submitQuizAnswer = async () => {
     if (!quizQuestion || !quizQuestion.correctAnswer) {
       return;
     }
@@ -121,146 +105,308 @@ const App = () => {
       return;
     }
 
-    const isCorrect = selectedOption === quizQuestion.correctAnswer;
-    const nextDifficulty = getNextDifficulty(
-      learningState.difficulty,
-      isCorrect,
-    );
+    try {
+      const result = await orchestrator.processAssessmentResult(
+        quizQuestion,
+        selectedOption,
+        learningState,
+      );
 
-    let feedbackMessage = "";
-    if (isCorrect) {
-      if (learningState.difficulty === "beginner") {
-        feedbackMessage =
-          "Correct! Great work on the fundamentals. Moving up to intermediate!";
-      } else if (learningState.difficulty === "intermediate") {
-        feedbackMessage =
-          "Correct! Excellent conceptual grasp. Advancing to advanced questions!";
+      setQuizFeedback(result.feedbackMessage);
+      setLearningState(result.updatedState);
+
+      if (result.decision?.qLearningMeta) {
+        setQTelemetry(result.decision.qLearningMeta);
       } else {
-        feedbackMessage =
-          "Correct! Outstanding mastery at the advanced level!";
+        setQTelemetry(qLearningAgent.getTelemetry());
       }
-    } else {
-      if (learningState.difficulty === "advanced") {
-        feedbackMessage = `Incorrect. Correct answer: ${quizQuestion.correctAnswer}. Stepping down to intermediate to reinforce core principles.`;
-      } else if (learningState.difficulty === "intermediate") {
-        feedbackMessage = `Incorrect. Correct answer: ${quizQuestion.correctAnswer}. Reviewing foundational concepts at beginner level.`;
-      } else {
-        feedbackMessage = `Incorrect. Correct answer: ${quizQuestion.correctAnswer}. Let's review this concept before trying another question.`;
-      }
+    } catch (error) {
+      console.error("App: Error processing quiz answer via Orchestrator:", error);
+      setQuizFeedback("An error occurred while evaluating your answer.");
     }
-
-    setQuizFeedback(feedbackMessage);
-
-    const attemptData = {
-      subject: learningState.selectedSubject,
-      difficulty: learningState.difficulty,
-      question: quizQuestion.question,
-      selectedAnswer: selectedOption,
-      correctAnswer: quizQuestion.correctAnswer,
-      isCorrect: isCorrect,
-      timestamp: new Date().toISOString(),
-    };
-
-    setLearningState((currentState) => ({
-      ...currentState,
-      difficulty: nextDifficulty,
-      questionsAnswered: currentState.questionsAnswered + 1,
-      correctAnswers: currentState.correctAnswers + (isCorrect ? 1 : 0),
-    }));
-
-    fetch("http://localhost:3001/api/progress/attempt", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(attemptData),
-    }).catch((error) => {
-      console.error("Error persisting quiz attempt:", error);
-    });
   };
 
+  const handleEnterVR = async () => {
+    const sessionResult = await requestImmersiveVRSession(
+      glRendererRef.current,
+    );
+    if (!sessionResult.success) {
+      setVrModalMessage(
+        sessionResult.message ||
+          "Immersive VR is unavailable on this device. Desktop VR Simulation is active.",
+      );
+    }
+  };
+
+  // Keyboard shortcut listener
+  React.useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Ignore when user is actively typing in a text field
+      if (
+        e.target &&
+        (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")
+      ) {
+        return;
+      }
+
+      if (e.key === "t" || e.key === "T") {
+        setIsChatOpen((prev) => !prev);
+      } else if (e.key === "q" || e.key === "Q") {
+        generateQuizQuestion();
+      } else if (e.key === "v" || e.key === "V") {
+        handleEnterVR();
+      } else if (e.key === "Escape") {
+        setVrModalMessage(null);
+        setIsChatOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [generateQuizQuestion]);
+
+  const activeDifficulty =
+    learningState.difficulty || learningState.currentDifficulty || "beginner";
+  const formattedDifficulty =
+    activeDifficulty.charAt(0).toUpperCase() + activeDifficulty.slice(1);
+
   return (
-    <>
-      <Experience />
-      <div className="subject-panel">
-        <p className="subject-panel-title">Subject</p>
-        <div className="subject-options">
-          {subjects.map((subject) => (
+    <div className="app-viewport">
+      {/* Primary 3D Virtual Classroom View */}
+      <Experience
+        learningState={learningState}
+        qTelemetry={qTelemetry}
+        onOpenChat={() => setIsChatOpen(true)}
+        onGenerateQuiz={generateQuizQuestion}
+        quizLoading={quizLoading}
+        onCanvasCreated={(gl) => {
+          glRendererRef.current = gl;
+        }}
+        quizQuestion={quizQuestion}
+        selectedOption={selectedOption}
+        onSelectOption={(opt) => {
+          setSelectedOption(opt);
+          setQuizFeedback("");
+        }}
+        onSubmitAnswer={submitQuizAnswer}
+        quizFeedback={quizFeedback}
+      />
+
+      {/* Transparent HUD Container: z-index: 10 */}
+      <main className="main-hud">
+        {/* Top Glassmorphism Navigation Bar */}
+        <div className="top-banner">
+          <div className="top-banner-brand">
+            <span>🎓</span> ADAPTIVEVERSE
+          </div>
+          <div className="top-banner-badges">
+            <span className="top-badge badge-desktop">● Desktop 3D Mode</span>
+            <span className="top-badge badge-rl">● Q-Learning Active</span>
+            <span className="top-badge badge-webxr">
+              ● {isWebXRAvailable() ? "WebXR Detected" : "WebXR Ready"}
+            </span>
+          </div>
+          <div className="top-banner-actions">
+            <div className="top-hotkeys-hint">
+              <span><kbd>Q</kbd> Quiz</span>
+              <span><kbd>T</kbd> Chat</span>
+              <span><kbd>V</kbd> VR</span>
+            </div>
             <button
-              key={subject}
-              className={`subject-option ${
-                learningState.selectedSubject === subject ? "active" : ""
-              }`}
               type="button"
-              onClick={() =>
-                setLearningState((currentState) => ({
-                  ...currentState,
-                  selectedSubject: subject,
-                }))
-              }
+              className="enter-vr-button"
+              onClick={handleEnterVR}
             >
-              {subject}
+              🥽 ENTER VR (V)
             </button>
-          ))}
+          </div>
         </div>
-      </div>
-      <div className="quiz-panel">
-        <p className="quiz-panel-title">Quiz</p>
-        <button
-          className="quiz-generate-button"
-          type="button"
-          onClick={generateQuizQuestion}
-          disabled={quizLoading}
-        >
-          {quizLoading ? "Generating..." : "Generate Question"}
-        </button>
-        {quizQuestion && Array.isArray(quizQuestion.options) && (
-          <div className="quiz-content">
-            <p className="quiz-question">{quizQuestion.question}</p>
-            <div className="quiz-options">
-              {quizQuestion.options.slice(0, 4).map((option) => (
+
+        {/* Left Glassmorphism Learning HUD */}
+        <aside className="left-hud-panel">
+          {/* Prominent Floating Ask Teacher Button */}
+          <button
+            type="button"
+            className="ask-teacher-btn"
+            onClick={() => setIsChatOpen(true)}
+          >
+            <span>💬</span> Ask Teacher (T)
+          </button>
+
+          {/* Subject Card */}
+          <div className="hud-card subject-card">
+            <p className="subject-card-title">SUBJECT</p>
+            <div className="subject-options">
+              {subjects.map((subject) => (
                 <button
-                  key={option}
-                  className={`quiz-option ${
-                    selectedOption === option ? "active" : ""
+                  key={subject}
+                  className={`subject-option ${
+                    learningState.selectedSubject === subject ? "active" : ""
                   }`}
                   type="button"
-                  onClick={() => {
-                    setSelectedOption(option);
-                    setQuizFeedback("");
-                  }}
+                  onClick={() =>
+                    setLearningState((currentState) => ({
+                      ...currentState,
+                      selectedSubject: subject,
+                    }))
+                  }
                 >
-                  {option}
+                  {subject}
                 </button>
               ))}
             </div>
-            <button
-              className="quiz-submit-button"
-              type="button"
-              onClick={submitQuizAnswer}
-            >
-              Submit
-            </button>
-            {quizFeedback && <p className="quiz-feedback">{quizFeedback}</p>}
           </div>
-        )}
-        {!quizQuestion && quizFeedback && (
-          <p className="quiz-feedback">{quizFeedback}</p>
-        )}
-      </div>
-      <div className="progress-panel">
-        <p className="progress-panel-title">Progress</p>
-        <p>Questions Answered: {learningState.questionsAnswered}</p>
-        <p>Correct Answers: {learningState.correctAnswers}</p>
-        <p>Accuracy: {accuracy}%</p>
-        <p>Current Difficulty: {learningState.difficulty}</p>
-        <p>Selected Subject: {learningState.selectedSubject}</p>
-      </div>
+
+          {/* Adaptive Quiz Card */}
+          <div className="hud-card quiz-card">
+            <div className="quiz-card-header">
+              <span className="quiz-card-title">ADAPTIVE QUIZ</span>
+              <button
+                className="quiz-generate-btn"
+                type="button"
+                onClick={generateQuizQuestion}
+                disabled={quizLoading}
+              >
+                {quizLoading ? "Generating..." : "⚡ Generate (Q)"}
+              </button>
+            </div>
+
+            {quizQuestion && Array.isArray(quizQuestion.options) && (
+              <div className="quiz-content-area">
+                <p className="quiz-question-text">{quizQuestion.question}</p>
+                <div className="quiz-options-grid">
+                  {quizQuestion.options.slice(0, 4).map((option) => (
+                    <button
+                      key={option}
+                      className={`quiz-opt-btn ${
+                        selectedOption === option ? "active" : ""
+                      }`}
+                      type="button"
+                      onClick={() => {
+                        setSelectedOption(option);
+                        setQuizFeedback("");
+                      }}
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  className="quiz-submit-action"
+                  type="button"
+                  onClick={submitQuizAnswer}
+                >
+                  Submit Answer
+                </button>
+                {quizFeedback && (
+                  <div className="quiz-feedback-box">{quizFeedback}</div>
+                )}
+              </div>
+            )}
+
+            {!quizQuestion && quizFeedback && (
+              <div className="quiz-feedback-box">{quizFeedback}</div>
+            )}
+          </div>
+
+          {/* Student Progress Card */}
+          <div className="hud-card progress-card">
+            <p className="progress-card-title">STUDENT PROGRESS</p>
+            <div className="progress-grid">
+              <div className="progress-grid-item">
+                <span className="progress-label">Answered:</span>
+                <span className="progress-value">{learningState.questionsAnswered}</span>
+              </div>
+              <div className="progress-grid-item">
+                <span className="progress-label">Correct:</span>
+                <span className="progress-value">{learningState.correctAnswers}</span>
+              </div>
+              <div className="progress-grid-item">
+                <span className="progress-label">Accuracy:</span>
+                <span className="progress-value font-bold">{accuracy}%</span>
+              </div>
+              <div className="progress-grid-item">
+                <span className="progress-label">Difficulty:</span>
+                <span className="progress-value val-difficulty">{formattedDifficulty}</span>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        {/* Right Glassmorphism Adaptive RL Telemetry Card */}
+        <aside className="rl-panel">
+          <p className="rl-panel-title">🤖 Adaptive RL (Q-Learning)</p>
+          <div className="rl-grid">
+            <div className="rl-row">
+              <span className="rl-label">Mode:</span>
+              <span className="rl-val">Tabular Q-Learning (Local)</span>
+            </div>
+            <div className="rl-row">
+              <span className="rl-label">State (s):</span>
+              <code className="rl-code">{qTelemetry.state || "init"}</code>
+            </div>
+            <div className="rl-row">
+              <span className="rl-label">Last Action (a):</span>
+              <code className="rl-code">{qTelemetry.action || "none"}</code>
+            </div>
+            <div className="rl-row">
+              <span className="rl-label">Reward (r):</span>
+              <span
+                className={
+                  (qTelemetry.reward ?? 0) >= 0
+                    ? "rl-reward-pos"
+                    : "rl-reward-neg"
+                }
+              >
+                {(qTelemetry.reward ?? 0) >= 0
+                  ? `+${qTelemetry.reward ?? 0}`
+                  : qTelemetry.reward}
+              </span>
+            </div>
+            <div className="rl-row">
+              <span className="rl-label">Exploration (ε):</span>
+              <span className="rl-val">
+                {Math.round((qTelemetry.epsilon ?? 0.2) * 100)}%
+              </span>
+            </div>
+            <div className="rl-row">
+              <span className="rl-label">Q-Value Q(s,a):</span>
+              <span className="rl-val">
+                {Number(qTelemetry.qValue ?? 0).toFixed(4)}
+              </span>
+            </div>
+          </div>
+        </aside>
+      </main>
+
+      {/* WebXR Fallback Modal */}
+      {vrModalMessage && (
+        <div
+          className="vr-modal-backdrop"
+          onClick={() => setVrModalMessage(null)}
+        >
+          <div className="vr-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="vr-modal-icon">🥽</div>
+            <h3 className="vr-modal-title">WebXR Status</h3>
+            <p className="vr-modal-text">{vrModalMessage}</p>
+            <button
+              type="button"
+              className="vr-modal-btn"
+              onClick={() => setVrModalMessage(null)}
+            >
+              Continue in Desktop Simulation
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Tutor Agent Interactive Chatbox */}
       <Chat
         learningState={learningState}
-        setLearningState={setLearningState}
+        isOpen={isChatOpen}
+        onToggle={(val) => setIsChatOpen(val)}
       />
-    </>
+    </div>
   );
 };
 

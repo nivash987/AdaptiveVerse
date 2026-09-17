@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useGLTF, useAnimations } from "@react-three/drei";
-import modelPath from "./emilian-avatar.glb";
+
+const modelPath = "/models/emilian-avatar.glb";
 
 export function Emilian(props) {
   const group = useRef();
@@ -9,9 +10,10 @@ export function Emilian(props) {
   console.log("ANIMATIONS", animations);
 
   useEffect(() => {
-    mixer
-      .clipAction(animations.find((a) => a.name === "IdleV4.2(maya_head)"))
-      .play();
+    const idleClip = animations?.find((a) => a.name === "IdleV4.2(maya_head)");
+    if (idleClip && mixer) {
+      mixer.clipAction(idleClip).play();
+    }
   }, [mixer, animations]);
 
   return (

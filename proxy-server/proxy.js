@@ -30,6 +30,14 @@ db.exec(`
     is_correct INTEGER NOT NULL,
     timestamp TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS q_learning_state (
+    state_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    q_value REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (state_key, action)
+  );
 `);
 
 const supportedSubjects = ["Artificial Intelligence", "Machine Learning"];
@@ -152,6 +160,58 @@ function getStudentLearningContext(selectedSubject) {
   }
 }
 
+const CANDIDATE_MODELS = [
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+  "gemini-flash-latest",
+];
+
+async function callGeminiWithFallback(systemInstruction, userPrompt) {
+  let lastError = null;
+
+  for (const model of CANDIDATE_MODELS) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemInstruction }],
+          },
+          contents: [
+            {
+              parts: [{ text: userPrompt }],
+            },
+          ],
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
+        return data.candidates[0].content.parts[0].text;
+      }
+
+      console.warn(
+        `Gemini model ${model} returned status ${response.status}:`,
+        data.error?.message || data,
+      );
+      lastError = data.error?.message || `HTTP ${response.status}`;
+    } catch (err) {
+      console.warn(`Gemini model ${model} fetch exception:`, err.message);
+      lastError = err.message;
+    }
+  }
+
+  throw new Error(`All Gemini models failed: ${lastError}`);
+}
+
 app.post("/api/chatgpt", async (req, res) => {
   try {
     console.log("Chat Request Body:", req.body);
@@ -160,6 +220,14 @@ app.post("/api/chatgpt", async (req, res) => {
       req.body.selectedSubject || "Artificial Intelligence";
     const difficulty = req.body.difficulty || "beginner";
     const studentQuestion = req.body.message;
+
+    if (
+      !studentQuestion ||
+      typeof studentQuestion !== "string" ||
+      !studentQuestion.trim()
+    ) {
+      return res.status(400).json({ error: "Empty message" });
+    }
 
     const learning = getStudentLearningContext(selectedSubject);
 
@@ -183,53 +251,13 @@ TEACHING & PERSONALIZATION INSTRUCTIONS:
   * If Machine Learning: teach ML paradigms (supervised, unsupervised, reinforcement), training workflows, loss functions, evaluation metrics, and algorithms.
 - NEVER mention internal database names, SQL queries, or backend tables (e.g. never say "According to your SQLite database"). Act naturally and supportively as an observant, thoughtful teacher.`;
 
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": process.env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text: systemPrompt,
-              },
-            ],
-          },
-          contents: [
-            {
-              parts: [
-                {
-                  text: studentQuestion,
-                },
-              ],
-            },
-          ],
-        }),
-      },
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("Gemini API Error:", data);
-      return res.status(response.status).json({
-        error: "Gemini API request failed",
-      });
-    }
-
-    const answer =
-      data.candidates?.[0]?.content?.parts?.[0]?.text ||
-      "Sorry, I could not generate a response.";
-
+    const answer = await callGeminiWithFallback(systemPrompt, studentQuestion);
     res.json({ response: answer });
   } catch (error) {
     console.error("Error Details:", error.message);
-    res.status(500).json({
-      error: "An error occurred while contacting Gemini",
+    res.status(503).json({
+      error:
+        "Teacher AI is temporarily unavailable. Check the Gemini API configuration or model availability.",
     });
   }
 });
@@ -272,47 +300,22 @@ CRITICAL RULES:
 - The "correctAnswer" MUST exactly match one of the options in the "options" array.
 - Do NOT wrap in markdown or backticks. Return raw JSON.`;
 
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": process.env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text: quizSystemPrompt,
-              },
-            ],
-          },
-          contents: [
-            {
-              parts: [
-                {
-                  text: `Generate one ${difficulty} adaptive quiz question for ${selectedSubject}.`,
-                },
-              ],
-            },
-          ],
-        }),
-      },
+    let quizText = await callGeminiWithFallback(
+      quizSystemPrompt,
+      `Generate one ${difficulty} adaptive quiz question for ${selectedSubject}.`,
     );
 
-    const data = await response.json();
+    quizText = quizText.replace(/```json/gi, "").replace(/```/g, "").trim();
 
-    if (!response.ok) {
-      console.error("Gemini Quiz API Error:", data);
-      return res.status(response.status).json({
-        error: "Gemini quiz request failed",
+    let quizQuestion;
+    try {
+      quizQuestion = JSON.parse(quizText);
+    } catch (parseErr) {
+      console.error("Quiz JSON Parse Error:", parseErr, "Raw text:", quizText);
+      return res.status(422).json({
+        error: "Quiz response could not be parsed. Please try again.",
       });
     }
-
-    let quizText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    quizText = quizText.replace(/```json/gi, "").replace(/```/g, "").trim();
-    const quizQuestion = JSON.parse(quizText);
 
     if (
       !quizQuestion ||
@@ -320,14 +323,16 @@ CRITICAL RULES:
       !Array.isArray(quizQuestion.options) ||
       !quizQuestion.correctAnswer
     ) {
-      throw new Error("Invalid quiz question format received from Gemini");
+      return res.status(422).json({
+        error: "Quiz response could not be parsed. Please try again.",
+      });
     }
 
     res.json(quizQuestion);
   } catch (error) {
     console.error("Quiz Error Details:", error.message);
-    res.status(500).json({
-      error: "An error occurred while generating a quiz question",
+    res.status(503).json({
+      error: "Gemini quiz generation is temporarily unavailable.",
     });
   }
 });
@@ -449,6 +454,47 @@ app.get("/api/progress", (req, res) => {
     res.status(500).json({
       error: "An error occurred while fetching progress",
     });
+  }
+});
+
+app.get("/api/qlearning/table", (req, res) => {
+  try {
+    const rows = db
+      .prepare("SELECT state_key, action, q_value FROM q_learning_state")
+      .all();
+    const table = {};
+    for (const row of rows) {
+      if (!table[row.state_key]) {
+        table[row.state_key] = {};
+      }
+      table[row.state_key][row.action] = Number(row.q_value);
+    }
+    res.json({ success: true, table });
+  } catch (error) {
+    console.error("Error fetching Q-learning table:", error);
+    res.status(500).json({ error: "Failed to fetch Q-learning table" });
+  }
+});
+
+app.post("/api/qlearning/update", (req, res) => {
+  try {
+    const { stateKey, action, qValue, timestamp } = req.body;
+    if (!stateKey || !action || qValue === undefined) {
+      return res.status(400).json({ error: "Missing required Q-learning fields" });
+    }
+    const updateTime = timestamp || new Date().toISOString();
+    const stmt = db.prepare(`
+      INSERT INTO q_learning_state (state_key, action, q_value, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(state_key, action) DO UPDATE SET
+        q_value = excluded.q_value,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run(stateKey, action, Number(qValue), updateTime);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error updating Q-learning table:", error);
+    res.status(500).json({ error: "Failed to update Q-learning table" });
   }
 });
 

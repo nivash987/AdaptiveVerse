@@ -1,6 +1,7 @@
 import React, { useRef } from "react";
 import { useGLTF } from "@react-three/drei";
-import modelPath from "./classroom.glb";
+
+const modelPath = "/models/classroom.glb";
 
 export function Classroom(props) {
   const { nodes, materials } = useGLTF(modelPath);
