@@ -3,6 +3,20 @@
 # 3D AI Classroom
 This project is a 3D AI classroom application built using Three.js, React Three Fiber, and the OpenAI API. It provides an immersive learning experience with an AI-powered teacher that can engage in interactive conversations with users.
 
+## 📸 Screenshots
+
+### 🏫 3D Virtual Classroom
+![3D Virtual Classroom](classroom.png)
+
+### 🤖 AI Teacher
+![AI Teacher](teacher.png)
+
+### 🧠 AI Quiz
+![AI Quiz](quiz.png)
+
+### 📝 Smartboard
+![Smartboard](smartboard.png)
+
 # Features
 - 3D classroom environment created with Blender
 - AI-powered teacher avatar with chat capabilities
